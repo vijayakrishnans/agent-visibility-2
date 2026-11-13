@@ -1,0 +1,143 @@
+apiVersion: sourceplane.io/v1
+kind: Component
+metadata:
+  name: web
+  description: The site — every agent surface and the dashboard, upstream's Worker on Cloudflare Workers + Static Assets, over the KV store and Workers AI, per environment
+spec:
+  type: cloudflare-workers-assets-turbo
+  lifecycle: production
+  owner: platform
+  # Its pages, attached to it in the workspace's catalog: what the Docs
+  # library shows for it, and what the catalog's docs and runbook checks read.
+  # Generated from what this manifest and its sources declare.
+  docs:
+    overview: docs/overview.md
+    pages:
+      - { path: docs/architecture.md, role: architecture, title: Architecture }
+      - { path: docs/runbook.md, role: runbook, title: Runbook }
+  # `app`, not `web`: a domain and a component share one name space in the
+  # catalog, and a domain called `web` hid this component from it.
+  domain: app
+  path: apps/web
+  # Its own lane per environment, so each environment's deploy waits on its
+  # own namespace and nothing else.
+  lane: isolated
+  # INFRA BEFORE APP. The Worker binds the KV namespace by id, and the id is
+  # rendered into its config during the build from the wiring document the
+  # cloudflare-kv root lease-publishes after its apply. A job resolves its
+  # secrets when it STARTS, so on a merge to main this deploy waits for that
+  # environment's apply (enforced) and the document is there; a pull request
+  # deploys nothing, so nothing on one waits (advisory).
+  dependsOn:
+    - component: cloudflare-kv
+      mode: enforced
+      modeRules:
+        - mode: advisory
+          when:
+            triggerRef: github-pull-request
+  secretEnv:
+    WIRING_CLOUDFLARE_KV_STAGE: "secret://org_5183e10f9cf54212a7f54999b135f14b/agent-visibility-2/stage/WIRING_CLOUDFLARE_KV"
+    WIRING_CLOUDFLARE_KV_PROD: "secret://org_5183e10f9cf54212a7f54999b135f14b/agent-visibility-2/prod/WIRING_CLOUDFLARE_KV"
+  # The admin token, stored per environment as the product's secret
+  # ADMIN_TOKEN (README → "Adding your pages"). The Worker reads it at request
+  # time, so the build hands it to the Worker as a Worker SECRET and no bundle
+  # contains it (buildCommand below). BEST-EFFORT, wire-now-seed-later: a key
+  # nobody has stored yet is skipped when the job resolves its secrets (no env
+  # var, no failure), and the Worker without it refuses every write (401), as
+  # upstream ships — so a fresh product deploys and serves its surfaces before
+  # its owner has chosen a token at all.
+  optionalSecretEnv:
+    ADMIN_TOKEN: "secret://org_5183e10f9cf54212a7f54999b135f14b/agent-visibility-2/{{ .environment }}/ADMIN_TOKEN"
+  subscribe:
+    environments:
+      - name: dev
+        profile: verify
+      - name: stage
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+      - name: prod
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+  # How the site runs itself for orun.work's live Preview tab
+  # (saas-parallel-baselining PB4): `orun preview` starts this, and a coding
+  # session keeps it running while it works, so the person watches it change
+  # as it is built. The dev server binds the box's loopback only, on a fixed
+  # port, and installs first, so a checkout the session has not installed yet
+  # still comes up.
+  # It is the site's own `pnpm dev` (build the dashboard, then `wrangler dev
+  # --local`: a local KV store, remote bindings off, so Workers AI is never
+  # called), plus a `vite build --watch` beside it: an edit to the dashboard
+  # rebuilds dist/client and wrangler reloads on the new assets, so the next
+  # load of the page shows it. wrangler refuses a port that is taken.
+  preview:
+    run:
+      - sh
+      - -c
+      - pnpm install --frozen-lockfile --prefer-offline --filter "@app/web..." && node_modules/.bin/vite build && { node_modules/.bin/vite build --watch --logLevel warn & } && exec node_modules/.bin/wrangler dev --local --ip 127.0.0.1 --port 8787 --show-interactive-dev-session=false
+    port: 8787
+    path: /
+    env:
+      NODE_OPTIONS: --max-old-space-size=512
+      WRANGLER_SEND_METRICS: "false"
+  parameters:
+    nodeVersion: "22"
+    pnpmVersion: "10.12.1"
+
+    workspaceDir: ../..
+    appDir: .
+
+    turboFilter: "@app/web"
+    wranglerConfig: wrangler.jsonc
+
+    # The Worker's entry is its source: `wrangler deploy` bundles it (Hono and
+    # upstream's surfaces) in the same command that uploads the dashboard,
+    # bound as ASSETS. The build only builds the dashboard.
+    workerEntrypoint: src/worker/index.ts
+    assetsDir: dist/client
+
+    # Per-env worker name: agent-visibility-2-web-{dev,stage,prod}.
+    workerName: agent-visibility-2-web
+    environmentAwareWorkerName: true
+
+    # The account's workers.dev subdomain; exported to the smoke step as
+    # ${WORKERS_DEV_SUBDOMAIN} and used to build ${DEPLOYED_URL}.
+    workersDevSubdomain: vijayakrishnan12994
+
+    installCommand: pnpm install --frozen-lockfile
+    # Render this environment's wrangler config, then build. stage and prod
+    # render from the wiring document their cloudflare-kv apply published
+    # (secretEnv above, resolved before the job's first step); dev, which no
+    # root applies to and which only verifies, renders from the committed
+    # fixture. The committed wrangler.jsonc (the fixture render) is what the
+    # composition's verify-app-structure step finds before this runs. The
+    # admin token never reaches the build (`env -u`); then, when the
+    # environment has it, it goes to the Worker as a SECRET
+    # (tooling/wire/worker-secrets.mjs: `wrangler secret bulk`, the value over
+    # stdin) before the composition deploys it. Only the deploy lane holds a
+    # Cloudflare credential, so a verify lane builds the same and pushes
+    # nothing.
+    buildCommand: node ../../tooling/wire/live.mjs --template wrangler.template.jsonc --out wrangler.jsonc --components cloudflare-kv --env "${ORUN_ENVIRONMENT}" --fixture wiring.fixture.json --fixture-envs dev && env -u ADMIN_TOKEN pnpm exec turbo run build --filter=@app/web && node ../../tooling/wire/worker-secrets.mjs --secret ADMIN_TOKEN --worker "agent-visibility-2-web-${ORUN_ENVIRONMENT}" --config wrangler.jsonc
+
+    # Smoke, read-only: /api/health — answered by the Worker ahead of the
+    # assets (run_worker_first) — reads the store through the KV binding and
+    # answers `"ok":true` (an unbound or unreachable namespace is a 503). It
+    # never calls the model, so a deploy neither warms the cache nor spends
+    # Workers AI: the surfaces (/llms.txt and the rest) all read the store, and
+    # on a cold one the first of them enriches every page. Then the
+    # dashboard's page is served from Static Assets (`id="root"`, its mount
+    # point). Not the site's name: that is the owner's to change. Nothing is
+    # written. Responses are buffered before grep so an early match cannot
+    # SIGPIPE curl.
+    smokeCommand: "health=$(curl -sf \"${DEPLOYED_URL}/api/health\") && echo \"${health}\" | grep -q '\"ok\":true' && html=$(curl -sfL \"${DEPLOYED_URL}/\") && echo \"${html}\" | grep -q 'id=\"root\"'"
+  labels:
+    team: platform
+    layer: delivery
+    surface: web
+    runtime: cloudflare
+# orun: redeploy 01-product as_4b21bc9c22b149fabc98
